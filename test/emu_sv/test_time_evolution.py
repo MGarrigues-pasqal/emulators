@@ -449,6 +449,41 @@ def test_noisy_steppers_use_krylov(
     assert cheb.call_count == 0
 
 
+@requires_kernel
+@pytest.mark.usefixtures("restore_rng_state")
+@pytest.mark.parametrize("stepper_type", [EvolveMonteCarlo, EvolveDensityMatrix])
+def test_noisy_steppers_use_krylov_cuda(
+    stepper_type: type[EvolveMonteCarlo] | type[EvolveDensityMatrix],
+) -> None:
+    """
+    Same as test_noisy_steppers_use_krylov on CUDA with Triton (N = 8, real kernel
+    availability): no Chebyshev step conditioned on the device either.
+    """
+    torch.manual_seed(1337)
+    N = 8
+    omegas, deltas, phis, interaction = get_randn_ham_params(N, with_phase=True)
+    ham_params = (omegas.to(dtype), deltas.to(dtype), phis.to(dtype), interaction)
+    lindblads = [math.sqrt(0.1) * torch.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=dtype)]
+    psi = get_randn_state(N, device="cuda")
+    state_in = psi if stepper_type is EvolveMonteCarlo else torch.outer(psi, psi.conj())
+
+    with (
+        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(
+            "emu_sv.time_evolution.implementations.krylov_exp",
+            autospec=True,
+            side_effect=krylov_exp,
+        ) as krylov,
+    ):
+        stepper_type().apply(0.1, *ham_params, state_in, 1e-10, lindblads)
+
+    assert krylov.call_count >= 1
+    for call in krylov.call_args_list:
+        bound = inspect.signature(krylov_exp).bind(*call.args, **call.kwargs)
+        assert bound.arguments["is_hermitian"] is False
+    assert cheb.call_count == 0
+
+
 @pytest.mark.usefixtures("restore_rng_state")
 def test_backward_uses_krylov_after_chebyshev_forward() -> None:
     torch.manual_seed(1337)
