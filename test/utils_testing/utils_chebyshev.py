@@ -1,12 +1,18 @@
 """
-Independent oracle and error budgets for the Chebyshev expansion of exp(-i alpha x).
+Independent oracles and error budgets for the Chebyshev expansion of exp(-i alpha x).
 
 exp(-i alpha x) = sum_k c_k T_k(x) on [-1, 1], with c_0 = J_0(alpha) and
-c_k = 2 (-i)^k J_k(alpha) (Jacobi-Anger). The oracle takes the c_k from the FFT of
-exp(-i alpha cos(theta)), independently of the Bessel recurrence of the code under test.
+c_k = 2 (-i)^k J_k(alpha) (Jacobi-Anger). Neither oracle uses the Bessel recurrence of
+the code under test:
+- `chebyshev_coefficients_exact`: power series of J_k in decimal arithmetic, accurate far
+  below double precision (coefficient tests, |alpha| <= a few hundred);
+- `chebyshev_coefficients_oracle`: FFT of exp(-i alpha cos(theta)), cheap for any alpha,
+  accurate to ~|alpha| eps (error budgets only).
 """
 
 import math
+from decimal import Decimal, localcontext
+from functools import lru_cache
 
 import torch
 
@@ -38,17 +44,50 @@ def chebyshev_coefficients_oracle(alpha: float) -> torch.Tensor:
     return coefs
 
 
-def oracle_coefficient_error(alpha: float) -> float:
+@lru_cache
+def _bessel_exact(a: float) -> tuple[Decimal, ...]:
     """
-    Bound on |c_k(oracle) - c_k| for each k:
-    - each sample: |alpha| * |fl(cos theta) - cos theta| <= 16 |alpha| eps
-      (theta rounded twice, cos once), exp: 2 eps;
-    - FFT (Higham, Accuracy and Stability, § 24.1): <= 5 log2(M) eps in 2-norm,
-      relative to ||f|| / sqrt(M) = 1 (|f| = 1, Parseval);
-    - c_k = 2 a_k doubles it.
+    J_0(a), ..., J_{L-1}(a) for a >= 0, L = _significant_length(a), from
+    J_k(a) = sum_m (-1)^m (a/2)^(2m+k) / (m! (m+k)!) in decimal arithmetic (a is exact).
+    The terms sum in absolute value to I_k(a) <= e^a, so a / ln(10) + 50 digits leave
+    50 correct digits after cancellation; the series is cut once its terms decrease and
+    are below 1e-60 (alternating: the remainder is smaller).
     """
-    size = 2 ** math.ceil(math.log2(4 * _significant_length(alpha)))
-    return 2 * (16 * abs(alpha) + 2 + 5 * math.log2(size)) * EPS
+    with localcontext() as ctx:
+        ctx.prec = int(a / math.log(10)) + 50
+        x = Decimal(a) / 2
+        x2 = x * x
+        tiny = Decimal(10) ** -60
+        values = []
+        first = Decimal(1)  # (a/2)^k / k!
+        for k in range(_significant_length(a)):
+            term, total, m = first, first, 0
+            while not (m * (m + k) > x2 and abs(term) < tiny):
+                m += 1
+                term = -term * x2 / (m * (m + k))
+                total += term
+            values.append(+total)
+            first = first * x / (k + 1)
+    return tuple(values)
+
+
+def chebyshev_coefficients_exact(alpha: float) -> tuple[torch.Tensor, list[Decimal]]:
+    """
+    c_0, c_1, ... of exp(-i alpha x) rounded to complex128 (error <= eps |c_k| / 2), and
+    the tails sum_{j > k} |c_j| in decimal arithmetic (for the truncation index).
+    J_k(-a) = (-1)^k J_k(a); terms beyond _significant_length are below 1e-30.
+    """
+    bessel = _bessel_exact(abs(alpha))
+    power = (1, -1j, -1, 1j) if alpha >= 0 else (1, 1j, -1, -1j)  # (-i)^k (sign alpha)^k
+    coefs = torch.tensor(
+        [complex(float(bessel[0]))]
+        + [2 * power[k % 4] * float(bessel[k]) for k in range(1, len(bessel))],
+        dtype=torch.complex128,
+    )
+    tails = [Decimal(0)] * len(bessel)
+    for k in range(len(bessel) - 2, -1, -1):
+        tails[k] = tails[k + 1] + 2 * abs(bessel[k + 1])
+    return coefs, tails
 
 
 def tails(coefs: torch.Tensor) -> torch.Tensor:

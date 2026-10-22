@@ -14,7 +14,7 @@ from test.utils_testing import (
 from emu_base.math.double_krylov import double_krylov
 from emu_base.math.krylov_exp import krylov_exp
 from emu_sv import hamiltonian_kernels as kernels
-from emu_sv.hamiltonian import interaction_diagonal
+from emu_sv.hamiltonian import RydbergHamiltonian, interaction_diagonal
 from emu_sv.time_evolution import (
     EvolveDensityMatrix,
     EvolveMonteCarlo,
@@ -148,6 +148,16 @@ def chebyshev_call_args(spy, call) -> dict:
     )
 
 
+def series_applications(spy) -> int:
+    """Number of H products of the recorded chebyshev_exp calls: K per call (contract)."""
+    from emu_base.math.chebyshev import exp_chebyshev_coefficients
+
+    calls = (chebyshev_call_args(spy, call) for call in spy.call_args_list)
+    return sum(
+        len(exp_chebyshev_coefficients(a["alpha"], a["tolerance"])) - 1 for a in calls
+    )
+
+
 def off_centre_params(nqubits: int, with_phase: bool) -> tuple[torch.Tensor, ...]:
     """Random parameters whose diagonal is not centred on 0 (shift c != 0)."""
     omegas, deltas, phis, interaction = get_randn_ham_params(nqubits, with_phase)
@@ -189,9 +199,14 @@ def test_chebyshev_step_accuracy(
 
 @pytest.mark.usefixtures("restore_rng_state")
 @pytest.mark.parametrize("use_chebyshev", [False, True])
-def test_evolve_dispatch(use_chebyshev: bool) -> None:
+@pytest.mark.parametrize("zero_omega", [False, True])
+def test_evolve_dispatch(use_chebyshev: bool, zero_omega: bool) -> None:
+    """use_chebyshev=False runs Lanczos, also at Omega = 0 (shortcut only on Chebyshev)."""
     torch.manual_seed(1337)
-    ham_params = off_centre_params(3, with_phase=True)
+    omegas, deltas, phis, interaction = off_centre_params(3, with_phase=True)
+    if zero_omega:
+        omegas[:] = 0.0
+    ham_params = omegas, deltas, phis, interaction
     state_in = get_randn_state(3, device=device)
 
     with (
@@ -202,7 +217,7 @@ def test_evolve_dispatch(use_chebyshev: bool) -> None:
             0.5, *ham_params, state_in, 1e-10, None, use_chebyshev
         )
 
-    assert cheb.call_count == int(use_chebyshev)
+    assert cheb.call_count == int(use_chebyshev and not zero_omega)
     assert krylov.call_count == int(not use_chebyshev)
 
 
@@ -231,21 +246,25 @@ def test_chebyshev_step_returns_unshifted_hamiltonian() -> None:
 
 
 @pytest.mark.usefixtures("restore_rng_state")
-@pytest.mark.parametrize("zero_omegas", [4, 3])
-def test_chebyshev_step_zero_omega(zero_omegas: int) -> None:
+@pytest.mark.parametrize("last_omega", [0.0, None, 1e-9])
+def test_chebyshev_step_zero_omega(last_omega: float | None) -> None:
     """
     With Omega = 0 on every qubit, H is diagonal and the step is exactly
-    exp(-i dt d) psi: no series, no Lanczos. With one qubit driven, the series runs.
+    exp(-i dt d) psi: no series, no Lanczos. With one qubit driven (random Omega, or
+    Omega = 1e-9, whose omission would cost ~1e-10 >> 1e-12), the series runs.
     """
     torch.manual_seed(1337)
     N, dt = 4, 1.0
     omegas, deltas, phis, interaction = off_centre_params(N, with_phase=True)
-    omegas[:zero_omegas] = 0.0
+    omegas[: N - 1] = 0.0
+    if last_omega is not None:
+        omegas[-1] = last_omega
+    zero_omega = last_omega == 0.0
     state_in = get_randn_state(N, device=device)
     state_copy = state_in.clone()
     h = dense_rydberg_hamiltonian(omegas, deltas, phis, interaction)
     expected = torch.linalg.matrix_exp(-1j * dt * h) @ state_in
-    if zero_omegas == N:
+    if zero_omega:
         # Budget per entry: the diagonal sums <= N + N(N-1)/2 terms, here and in the dense
         # reference: phase error <= |dt| 2 n_terms eps S; exp and product: 4 eps;
         # plus the matrix_exp estimate. atol = 3x the budget.
@@ -263,7 +282,7 @@ def test_chebyshev_step_zero_omega(zero_omegas: int) -> None:
             dt, omegas, deltas, phis, interaction, state_in, 1e-10, None, True
         )
 
-    assert cheb.call_count == int(zero_omegas < N)
+    assert cheb.call_count == int(not zero_omega)
     assert krylov.call_count == 0
     assert torch.equal(state_in, state_copy)
     assert state_out.data_ptr() != state_in.data_ptr()
@@ -319,16 +338,18 @@ def test_chebyshev_large_alpha_is_split(dt: float, substeps: int) -> None:
 @pytest.mark.usefixtures("restore_rng_state")
 @pytest.mark.parametrize("chebyshev_on_gpu", [None, True, False])
 @pytest.mark.parametrize("kernel_available", [True, False])
+@pytest.mark.parametrize("requires_grad", [False, True])
 def test_evolve_state_vector_dispatch(
-    chebyshev_on_gpu: bool | None, kernel_available: bool
+    chebyshev_on_gpu: bool | None, kernel_available: bool, requires_grad: bool
 ) -> None:
     """
     Chebyshev iff the option is on (default: on) and the fused kernel is available
     for the state (CUDA, Triton, complex128, N >= 8); the choice is the 9th argument.
+    Recording autograd (inputs that require grad) does not change the choice.
     """
     torch.manual_seed(1337)
-    ham_params = get_randn_ham_params(3)
-    state_in = get_randn_state(3, device=device)
+    ham_params = get_randn_ham_params(3, requires_grad=requires_grad)
+    state_in = get_randn_state(3, device=device, requires_grad=requires_grad)
     if chebyshev_on_gpu is None:
         stepper = EvolveStateVector()
     else:
@@ -391,7 +412,11 @@ def test_evolve_state_vector_uses_krylov_without_kernel(dev: str) -> None:
 def test_noisy_steppers_use_krylov(
     stepper_type: type[EvolveMonteCarlo] | type[EvolveDensityMatrix],
 ) -> None:
-    """Monte Carlo and density-matrix steps keep the non-Hermitian Lanczos."""
+    """
+    Monte Carlo and density-matrix steps keep the non-Hermitian Lanczos, even where the
+    noiseless steps would use Chebyshev: the kernel availability is forced to True
+    (H products kept on the torch path, as the kernel needs CUDA).
+    """
     torch.manual_seed(1337)
     N = 3
     omegas, deltas, phis, interaction = get_randn_ham_params(N, with_phase=True)
@@ -402,6 +427,12 @@ def test_noisy_steppers_use_krylov(
     state_in = psi if stepper_type is EvolveMonteCarlo else torch.outer(psi, psi.conj())
 
     with (
+        patch(
+            "emu_sv.hamiltonian_kernels.is_available", autospec=True, return_value=True
+        ),
+        patch.object(
+            RydbergHamiltonian, "_use_kernel", autospec=True, return_value=False
+        ),
         patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
         patch(
             "emu_sv.time_evolution.implementations.krylov_exp",
@@ -469,12 +500,14 @@ def test_chebyshev_forward_gradients_match_krylov_forward(N: int) -> None:
             torch.vdot(r, state_out).real, (*ham_params, state_in)
         )
 
-    # Budget: both runs execute the same backward on saved states that differ only by
-    # the in-place normalisation of the Krylov path (relative change ~eps). If each run
-    # is within the Lanczos tolerance of the exact gradient (what double_krylov's
-    # stopping rule targets; an estimate, not a proven bound), they differ by <= 2 tol.
+    # Both runs execute the same deterministic backward on the saved inputs; this only
+    # checks that the input state is saved (not a second accuracy bound). The saved
+    # states differ at most by the in-place division of the Krylov path by the computed
+    # norm, 1 + O(N eps): the gradients then differ by the rounding of the backward,
+    # estimated at 16 dim eps max|g|. Measured: bitwise equal (N = 3, 5).
     for g_cheb, g_krylov in zip(grads[True], grads[False]):
-        torch.testing.assert_close(g_cheb, g_krylov, rtol=0.0, atol=2 * tolerance)
+        atol = 16 * 2**N * EPS * g_krylov.abs().max().item()
+        torch.testing.assert_close(g_cheb, g_krylov, rtol=0.0, atol=atol)
 
 
 @pytest.mark.usefixtures("restore_rng_state")
@@ -543,7 +576,7 @@ def test_chebyshev_steps_cuda_match_dense(N: int) -> None:
             )
 
     assert cheb.call_count == nsteps
-    assert kernel.call_count >= nsteps
+    assert kernel.call_count == series_applications(cheb)  # every H product
     assert state.is_cuda
     torch.testing.assert_close(state.cpu(), expected, rtol=0.0, atol=3 * budget)
 
@@ -599,11 +632,16 @@ def test_forward_backward_accuracy_cuda(N: int, chebyshev_on_gpu: bool) -> None:
         state_out, _ = EvolveStateVector(chebyshev_on_gpu=chebyshev_on_gpu).apply(
             dt, *ham_params, state_in, tolerance, []
         )
+        forward_kernel_calls = kernel.call_count
         grads = torch.autograd.grad(
             torch.vdot(r, state_out).real, (*ham_params, state_in)
         )
     assert cheb.call_count == int(chebyshev_on_gpu)
-    assert kernel.call_count >= 1
+    if chebyshev_on_gpu:  # every H product of the series
+        assert forward_kernel_calls == series_applications(cheb)
+    else:
+        assert forward_kernel_calls >= 1
+    assert kernel.call_count > forward_kernel_calls  # backward
 
     expected = do_dense_time_step(dt, *ham_params, state_in)
     expected_grads = torch.autograd.grad(
