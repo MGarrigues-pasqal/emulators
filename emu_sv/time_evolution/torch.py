@@ -9,8 +9,8 @@ from emu_base.math.krylov_exp import krylov_exp
 from emu_base.math.chebyshev import chebyshev_exp
 
 # The Chebyshev series is truncated where its error bound reaches this fraction of
-# krylov_tolerance: the Lanczos stopping test is pessimistic, the Chebyshev bound nearly
-# attained; with this factor, the Chebyshev errors were measured below the Lanczos ones.
+# krylov_tolerance: the Lanczos stopping test overestimates the error (see
+# docs/emu_sv/benchmarks/accuracy.md), whereas the Chebyshev bound is nearly attained.
 CHEBYSHEV_TOLERANCE_FACTOR = 1e-2
 # Steps with a larger alpha = r dt are split into equal sub-steps (rounding control).
 CHEBYSHEV_MAX_ALPHA = 2000.0

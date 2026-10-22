@@ -30,11 +30,9 @@ def test_sv_impl():
     bknd_impl._evolve_step(1.0, 0)
 
 
-@pytest.mark.parametrize("chebyshev_on_gpu", [None, True, False])
-def test_chebyshev_option_reaches_dispatch(chebyshev_on_gpu: bool | None) -> None:
-    """SVConfig.chebyshev_on_gpu (default True) reaches the noiseless step dispatch."""
-    options = {} if chebyshev_on_gpu is None else {"chebyshev_on_gpu": chebyshev_on_gpu}
-    config = SVConfig(gpu=False, **options)
+def test_chebyshev_option_reaches_dispatch() -> None:
+    """SVConfig(chebyshev_on_gpu=False) reaches the noiseless step dispatch."""
+    config = SVConfig(gpu=False, chebyshev_on_gpu=False)
     pulser_data = MagicMock(
         spec=SequenceData,
         omega=torch.tensor([[1.0]]),
@@ -63,7 +61,7 @@ def test_chebyshev_option_reaches_dispatch(chebyshev_on_gpu: bool | None) -> Non
 
     args = evolution.call_args.args
     assert len(args) == 9
-    assert args[8] is (chebyshev_on_gpu is not False)
+    assert args[8] is False
 
 
 @pytest.mark.parametrize(

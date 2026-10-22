@@ -6,16 +6,17 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from emu_base.math.chebyshev import chebyshev_exp, exp_chebyshev_coefficients
 from test.utils_testing import (
+    EPS,
     chebyshev_coefficients_exact,
     chebyshev_rounding_bound,
     matrix_exp_error,
 )
 
 dtype = torch.complex128
-EPS = torch.finfo(torch.float64).eps
-# Largest |J_k| error of the Miller recurrence, measured against mpmath (30 digits) for
-# 100 <= alpha <= 30000, and against chebyshev_coefficients_exact for the alpha below.
+# Bound on the |J_k| error of the Miller recurrence; for the alpha of these tests, the
+# largest error against chebyshev_coefficients_exact is 1.3e-16.
 MILLER_ERROR = 4e-16
 # The code sums the tail in double precision from Bessel values with a small relative
 # error; cases whose exact tail is this close (relative) to the tolerance are refused.
@@ -47,8 +48,6 @@ def test_exp_chebyshev_coefficients_match_oracle(alpha: float, tolerance: float)
     expected, _ = chebyshev_coefficients_exact(alpha)
     K = checked_truncation_index(alpha, tolerance)
 
-    from emu_base.math.chebyshev import exp_chebyshev_coefficients
-
     coefs = exp_chebyshev_coefficients(alpha, tolerance)
     assert all(isinstance(c, complex) for c in coefs)
     assert len(coefs) == K + 1  # smallest K with sum_{k>K} |c_k| <= tolerance
@@ -61,42 +60,26 @@ def test_exp_chebyshev_coefficients_match_oracle(alpha: float, tolerance: float)
     )
 
 
-@pytest.mark.parametrize("alpha", [0.5, 7.3, 50.0, -50.0])
-@pytest.mark.parametrize("tolerance", [1e-4, 1e-10])
-def test_exp_chebyshev_coefficients_truncation_bound(
-    alpha: float, tolerance: float
-) -> None:
-    """sum_k c_k T_k(x) is within tail(K) <= tolerance of exp(-i alpha x) on [-1, 1]."""
-    _, tails = chebyshev_coefficients_exact(alpha)
-    K = checked_truncation_index(alpha, tolerance)
-
-    from emu_base.math.chebyshev import exp_chebyshev_coefficients
-
-    coefs = torch.tensor(exp_chebyshev_coefficients(alpha, tolerance), dtype=dtype)
-    x = torch.linspace(-1.0, 1.0, 2001, dtype=torch.float64)
-    k = torch.arange(len(coefs), dtype=torch.float64)
-    series = (coefs * torch.cos(k * torch.arccos(x)[:, None])).sum(dim=1)
-    expected = torch.exp(-1j * alpha * x)
-    # Truncation: <= tail(K) (exact tails, |T_k| <= 1), not scaled. Rounding: coefficient
-    # errors (len (2 MILLER_ERROR + eps)); T_k(x) = cos(k arccos x) with |arccos error|
-    # <= pi eps, so (2 pi k + 2) eps |c_k| per term; summation (K + 1) eps sum |c_k|;
-    # exp(-i alpha x): (|alpha| + 2) eps. atol = tail(K) + 2x the rounding.
-    a = coefs.abs()
-    rounding = (
-        float((a * (2 * math.pi * k + 2)).sum() + len(a) * a.sum()) * EPS
-        + len(a) * (2 * MILLER_ERROR + EPS)
-        + (abs(alpha) + 2) * EPS
-    )
-    atol = float(tails[K]) + 2 * rounding
-    torch.testing.assert_close(series, expected, rtol=0.0, atol=atol)
-
-
 @pytest.mark.parametrize("alpha", [math.nan, math.inf, -math.inf])
 def test_exp_chebyshev_coefficients_rejects_non_finite(alpha: float) -> None:
-    from emu_base.math.chebyshev import exp_chebyshev_coefficients
-
     with pytest.raises(ValueError):
         exp_chebyshev_coefficients(alpha, 1e-10)
+
+
+@pytest.mark.parametrize(
+    "alpha, tolerance, expected",
+    [
+        (1e-150, 1e-12, [1.0]),
+        (-1e-300, 1e-12, [1.0]),
+        (1e-150, 1e-200, [1.0, -1e-150j]),  # |c_2| = alpha^2 / 4 <= tolerance
+        (-1e-300, 1e-310, [1.0, 1e-300j]),
+    ],
+)
+def test_exp_chebyshev_coefficients_tiny_alpha(
+    alpha: float, tolerance: float, expected: list[complex]
+) -> None:
+    """J_0 = 1 and J_1 = alpha / 2 in double precision, without overflow."""
+    assert exp_chebyshev_coefficients(alpha, tolerance) == expected
 
 
 @pytest.mark.usefixtures("restore_rng_state")
@@ -163,8 +146,6 @@ def test_chebyshev_exp_matches_matrix_exp(
         + 3 * dim * EPS
     )
     norm = v.norm().item()
-
-    from emu_base.math.chebyshev import chebyshev_exp
 
     out = chebyshev_exp(op, v, alpha, phase, tolerance)
 

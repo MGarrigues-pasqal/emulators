@@ -19,9 +19,11 @@ def exp_chebyshev_coefficients(alpha: float, tolerance: float) -> list[complex]:
     """
     if not math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
-    if alpha == 0.0:
-        return [1.0 + 0.0j]
     a = abs(alpha)
+    if a < 1e-50:
+        # c₀ = 1 and c₁ = -iα in double precision, |c₂| ≈ α²/4 is below any useful
+        # tolerance, and the recurrence below would overflow.
+        return [1.0 + 0.0j] if a <= tolerance else [1.0 + 0.0j, -1.0j * alpha]
     # Jₖ(a) decays faster than exponentially once k > a + O(a^(1/3)).
     start = int(a + 12.0 * a ** (1.0 / 3.0) + 60.0)
     values = [0.0] * (start + 1)

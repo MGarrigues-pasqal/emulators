@@ -61,7 +61,9 @@ class SVConfig(EmulationConfig):
         chebyshev_on_gpu: noiseless state-vector time steps on a CUDA GPU, when the
             fused Hamiltonian kernel is used (Triton available), expand exp(-i dt H)
             in Chebyshev polynomials instead of using the Lanczos algorithm.
-            Set to False to use Lanczos everywhere (as in previous versions).
+            Results then differ from Lanczos (CPU runs, previous versions) at the
+            level of krylov_tolerance per time step; set to False to use Lanczos
+            everywhere and reproduce them.
         kwargs: arguments that are passed to the base class
 
     Examples:
@@ -95,7 +97,6 @@ class SVConfig(EmulationConfig):
     ):
         super().__init__(
             solver=solver,
-            chebyshev_on_gpu=chebyshev_on_gpu,
             dt=dt,
             max_krylov_dim=max_krylov_dim,
             gpu=gpu,
@@ -103,6 +104,7 @@ class SVConfig(EmulationConfig):
             interaction_cutoff=interaction_cutoff,
             log_level=log_level,
             log_file=log_file,
+            chebyshev_on_gpu=chebyshev_on_gpu,
             **kwargs,
         )
 

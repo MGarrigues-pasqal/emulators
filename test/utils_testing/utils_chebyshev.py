@@ -16,9 +16,9 @@ from functools import lru_cache
 
 import torch
 
+from emu_sv.time_evolution.torch import CHEBYSHEV_MAX_ALPHA
+
 EPS = torch.finfo(torch.float64).eps
-# exp(-i dt H) is split into sub-steps of alpha <= MAX_ALPHA (see emu_sv.time_evolution.torch)
-MAX_ALPHA = 2000.0
 
 
 def _significant_length(alpha: float) -> int:
@@ -140,16 +140,17 @@ def chebyshev_step_budget(
     the dense Rydberg Hamiltonian built from `omegas` (raw Rabi frequencies) and
     `tolerance` is the truncation tolerance of the whole step.
     Spectral bounds as in the code under test, from independent inputs: the dense
-    diagonal and R = sum_j |Omega_j| / 2 (Gershgorin). Sub-steps of alpha <= MAX_ALPHA,
-    each with tolerance / m. The operator 2 (H - c) / r applied by the torch path sums
-    N + 1 terms per row with absolute row sums <= 2: local error <= (2 (N + 1) + 3) eps.
+    diagonal and R = sum_j |Omega_j| / 2 (Gershgorin). Sub-steps of
+    alpha <= CHEBYSHEV_MAX_ALPHA, each with tolerance / m. The operator 2 (H - c) / r
+    applied by the torch path sums N + 1 terms per row with absolute row sums <= 2:
+    local error <= (2 (N + 1) + 3) eps.
     """
     nqubits = len(omegas)
     d = h.diagonal().real
     radius = omegas.abs().sum().item() / 2
     r = (d.max() - d.min()).item() / 2 + radius
     alpha = r * dt
-    m = max(1, math.ceil(abs(alpha) / MAX_ALPHA))
+    m = max(1, math.ceil(abs(alpha) / CHEBYSHEV_MAX_ALPHA))
     coefs = chebyshev_coefficients_oracle(alpha / m)
     K = truncation_index(coefs, tolerance / m)
     local = (2 * (nqubits + 1) + 3) * EPS

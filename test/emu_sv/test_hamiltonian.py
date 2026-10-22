@@ -2,9 +2,11 @@ import torch
 import pytest
 from unittest.mock import patch
 from test.utils_testing import (
+    EPS,
     dense_rydberg_hamiltonian,
     nn_interaction_matrix,
     randn_interaction_matrix,
+    requires_kernel,
 )
 from emu_sv.state_vector import StateVector
 from emu_sv.hamiltonian import RydbergHamiltonian, interaction_diagonal
@@ -249,13 +251,6 @@ def test_fused_kernel_matches_torch(N: int, with_phase: bool, with_noise: bool) 
     assert not ham_grad._use_kernel(state)
     with torch.no_grad():
         assert ham_grad._use_kernel(state)
-
-
-EPS = torch.finfo(torch.float64).eps
-requires_kernel = pytest.mark.skipif(
-    not torch.cuda.is_available() or kernels.triton is None,
-    reason="the fused kernel needs CUDA and Triton",
-)
 
 
 @pytest.mark.usefixtures("restore_rng_state")

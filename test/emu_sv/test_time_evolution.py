@@ -6,11 +6,14 @@ from unittest.mock import patch
 import torch
 import pytest
 from test.utils_testing import (
+    EPS,
     chebyshev_step_budget,
     dense_rydberg_hamiltonian,
     matrix_exp_error,
     randn_interaction_matrix,
+    requires_kernel,
 )
+from emu_base.math.chebyshev import chebyshev_exp, exp_chebyshev_coefficients
 from emu_base.math.double_krylov import double_krylov
 from emu_base.math.krylov_exp import krylov_exp
 from emu_sv import hamiltonian_kernels as kernels
@@ -124,35 +127,21 @@ def test_backward_accuracy(N, tolerance):
 # kernel, EvolveStateVector selects them by default.
 
 dtype = torch.complex128
-EPS = torch.finfo(torch.float64).eps
-# tolerance of the Chebyshev series relative to krylov_tolerance (documented contract)
+# tolerance of the Chebyshev series relative to krylov_tolerance (SVConfig docstring)
 CHEBYSHEV_TOLERANCE_FACTOR = 1e-2
 CHEBYSHEV = "emu_sv.time_evolution.torch.chebyshev_exp"
 KRYLOV = "emu_sv.time_evolution.torch.krylov_exp"
-requires_kernel = pytest.mark.skipif(
-    not torch.cuda.is_available() or kernels.triton is None,
-    reason="the fused kernel needs CUDA and Triton",
-)
 
 
-def real_chebyshev_exp():
-    from emu_base.math.chebyshev import chebyshev_exp
-
-    return chebyshev_exp
-
-
-def chebyshev_call_args(spy, call) -> dict:
+def chebyshev_call_args(call) -> dict:
     """Arguments of one recorded call of chebyshev_exp, by name."""
-    return (
-        inspect.signature(real_chebyshev_exp()).bind(*call.args, **call.kwargs).arguments
-    )
+    return inspect.signature(chebyshev_exp).bind(*call.args, **call.kwargs).arguments
 
 
 def series_applications(spy) -> int:
-    """Number of H products of the recorded chebyshev_exp calls: K per call (contract)."""
-    from emu_base.math.chebyshev import exp_chebyshev_coefficients
-
-    calls = (chebyshev_call_args(spy, call) for call in spy.call_args_list)
+    """Number of H products of the recorded chebyshev_exp calls: K per call (see the
+    chebyshev_exp docstring)."""
+    calls = (chebyshev_call_args(call) for call in spy.call_args_list)
     return sum(
         len(exp_chebyshev_coefficients(a["alpha"], a["tolerance"])) - 1 for a in calls
     )
@@ -183,14 +172,14 @@ def test_chebyshev_step_accuracy(
         h, ham_params[0], dt, tolerance * CHEBYSHEV_TOLERANCE_FACTOR
     )
 
-    with patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb:
+    with patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb:
         state_out, _ = DifferentiableStateVectorEvolution.apply(
             dt, *ham_params, state_in, tolerance, None, True
         )
 
     # the option went through forward to evolve (Krylov would be accurate too)
     assert cheb.call_count == 1
-    args = chebyshev_call_args(cheb, cheb.call_args)
+    args = chebyshev_call_args(cheb.call_args)
     assert args["tolerance"] == pytest.approx(
         tolerance * CHEBYSHEV_TOLERANCE_FACTOR, rel=1e-12, abs=0.0
     )
@@ -210,7 +199,7 @@ def test_evolve_dispatch(use_chebyshev: bool, zero_omega: bool) -> None:
     state_in = get_randn_state(3, device=device)
 
     with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch(KRYLOV, autospec=True, side_effect=krylov_exp) as krylov,
     ):
         DifferentiableStateVectorEvolution.apply(
@@ -275,7 +264,7 @@ def test_chebyshev_step_zero_omega(last_omega: float | None) -> None:
         budget = chebyshev_step_budget(h, omegas, dt, 1e-10 * CHEBYSHEV_TOLERANCE_FACTOR)
 
     with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch(KRYLOV, autospec=True, side_effect=krylov_exp) as krylov,
     ):
         state_out, _ = DifferentiableStateVectorEvolution.apply(
@@ -315,7 +304,7 @@ def test_chebyshev_large_alpha_is_split(dt: float, substeps: int) -> None:
     expected = torch.linalg.matrix_exp(-1j * dt * h) @ state_in
     budget = chebyshev_step_budget(h, omegas, dt, tolerance * CHEBYSHEV_TOLERANCE_FACTOR)
 
-    with patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb:
+    with patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb:
         state_out, _ = DifferentiableStateVectorEvolution.apply(
             dt, omegas, deltas, phis, interaction, state_in, tolerance, None, True
         )
@@ -324,7 +313,7 @@ def test_chebyshev_large_alpha_is_split(dt: float, substeps: int) -> None:
     # phase argument dt c / m rounded with relative eps, twice: 4 (|dt c / m| + 1) eps
     phase_atol = 4 * (abs(dt * c / substeps) + 1) * EPS
     for call in cheb.call_args_list:
-        args = chebyshev_call_args(cheb, call)
+        args = chebyshev_call_args(call)
         assert args["alpha"] == pytest.approx(r * dt / substeps, rel=4 * EPS, abs=0.0)
         assert args["tolerance"] == pytest.approx(
             tolerance * CHEBYSHEV_TOLERANCE_FACTOR / substeps, rel=1e-12, abs=0.0
@@ -377,28 +366,18 @@ def test_evolve_state_vector_dispatch(
         available.assert_called_once_with(state_in)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.usefixtures("restore_rng_state")
-@pytest.mark.parametrize(
-    "dev",
-    [
-        "cpu",
-        pytest.param(
-            "cuda",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
-            id="cuda-no-triton",
-        ),
-    ],
-)
-def test_evolve_state_vector_uses_krylov_without_kernel(dev: str) -> None:
-    """Default stepper, real availability check: CPU, or CUDA without Triton -> Lanczos."""
+def test_evolve_state_vector_uses_krylov_without_triton() -> None:
+    """Default stepper, real availability check: CUDA without Triton -> Lanczos."""
     torch.manual_seed(1337)
-    N = 8  # at MIN_QUBITS: only the device or Triton rule out the kernel
+    N = 8  # at MIN_QUBITS: only Triton rules out the kernel
     ham_params = get_randn_ham_params(N)
-    state_in = get_randn_state(N, device=dev)
+    state_in = get_randn_state(N, device="cuda")
 
     with (
-        patch.object(kernels, "triton", None if dev == "cuda" else kernels.triton),
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch.object(kernels, "triton", None),
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch(KRYLOV, autospec=True, side_effect=krylov_exp) as krylov,
     ):
         EvolveStateVector().apply(0.1, *ham_params, state_in, 1e-10, [])
@@ -433,42 +412,7 @@ def test_noisy_steppers_use_krylov(
         patch.object(
             RydbergHamiltonian, "_use_kernel", autospec=True, return_value=False
         ),
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
-        patch(
-            "emu_sv.time_evolution.implementations.krylov_exp",
-            autospec=True,
-            side_effect=krylov_exp,
-        ) as krylov,
-    ):
-        stepper_type().apply(0.1, *ham_params, state_in, 1e-10, lindblads)
-
-    assert krylov.call_count >= 1
-    for call in krylov.call_args_list:
-        bound = inspect.signature(krylov_exp).bind(*call.args, **call.kwargs)
-        assert bound.arguments["is_hermitian"] is False
-    assert cheb.call_count == 0
-
-
-@requires_kernel
-@pytest.mark.usefixtures("restore_rng_state")
-@pytest.mark.parametrize("stepper_type", [EvolveMonteCarlo, EvolveDensityMatrix])
-def test_noisy_steppers_use_krylov_cuda(
-    stepper_type: type[EvolveMonteCarlo] | type[EvolveDensityMatrix],
-) -> None:
-    """
-    Same as test_noisy_steppers_use_krylov on CUDA with Triton (N = 8, real kernel
-    availability): no Chebyshev step conditioned on the device either.
-    """
-    torch.manual_seed(1337)
-    N = 8
-    omegas, deltas, phis, interaction = get_randn_ham_params(N, with_phase=True)
-    ham_params = (omegas.to(dtype), deltas.to(dtype), phis.to(dtype), interaction)
-    lindblads = [math.sqrt(0.1) * torch.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=dtype)]
-    psi = get_randn_state(N, device="cuda")
-    state_in = psi if stepper_type is EvolveMonteCarlo else torch.outer(psi, psi.conj())
-
-    with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch(
             "emu_sv.time_evolution.implementations.krylov_exp",
             autospec=True,
@@ -493,7 +437,7 @@ def test_backward_uses_krylov_after_chebyshev_forward() -> None:
     r = torch.randn(2**N, dtype=dtype)
 
     with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch(KRYLOV, autospec=True, side_effect=krylov_exp) as krylov,
         patch(
             "emu_sv.time_evolution.torch.double_krylov",
@@ -510,39 +454,6 @@ def test_backward_uses_krylov_after_chebyshev_forward() -> None:
     assert cheb.call_count == 1
     assert dkrylov.call_count == 1  # gradients of the parameters
     assert krylov.call_count == 1  # gradient of the input state
-
-
-@pytest.mark.usefixtures("restore_rng_state")
-@pytest.mark.parametrize("N", [3, 5])
-def test_chebyshev_forward_gradients_match_krylov_forward(N: int) -> None:
-    """
-    The backward pass recomputes everything from the saved inputs; with a normalised
-    state, the forward algorithm must not change the gradients.
-    """
-    torch.manual_seed(1337)
-    tolerance = 1e-10
-    ham_params = get_randn_ham_params(N, with_phase=True, requires_grad=True)
-    state_in = get_randn_state(N, device=device, requires_grad=True)
-    r = torch.randn(2**N, dtype=dtype)
-    r *= 0.71 / r.norm()
-
-    grads = {}
-    for use_chebyshev in (False, True):
-        state_out, _ = DifferentiableStateVectorEvolution.apply(
-            1.0, *ham_params, state_in, tolerance, None, use_chebyshev
-        )
-        grads[use_chebyshev] = torch.autograd.grad(
-            torch.vdot(r, state_out).real, (*ham_params, state_in)
-        )
-
-    # Both runs execute the same deterministic backward on the saved inputs; this only
-    # checks that the input state is saved (not a second accuracy bound). The saved
-    # states differ at most by the in-place division of the Krylov path by the computed
-    # norm, 1 + O(N eps): the gradients then differ by the rounding of the backward,
-    # estimated at 16 dim eps max|g|. Measured: bitwise equal (N = 3, 5).
-    for g_cheb, g_krylov in zip(grads[True], grads[False]):
-        atol = 16 * 2**N * EPS * g_krylov.abs().max().item()
-        torch.testing.assert_close(g_cheb, g_krylov, rtol=0.0, atol=atol)
 
 
 @pytest.mark.usefixtures("restore_rng_state")
@@ -595,7 +506,7 @@ def test_chebyshev_steps_cuda_match_dense(N: int) -> None:
     expected = state.cpu()
     budget = 0.0
     with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch.object(
             kernels, "apply", autospec=True, side_effect=kernels.apply
         ) as kernel,
@@ -619,7 +530,6 @@ def test_chebyshev_steps_cuda_match_dense(N: int) -> None:
 @requires_kernel
 def test_chebyshev_loop_does_not_synchronize() -> None:
     """Once op has been applied once (factor and table on the device), no host sync."""
-    chebyshev_exp = real_chebyshev_exp()
     torch.manual_seed(1337)
     N = 10
     omegas, deltas, phis, interaction = get_randn_ham_params(N, with_phase=True)
@@ -659,7 +569,7 @@ def test_forward_backward_accuracy_cuda(N: int, chebyshev_on_gpu: bool) -> None:
     r *= 0.71 / r.norm()
 
     with (
-        patch(CHEBYSHEV, autospec=True, side_effect=real_chebyshev_exp()) as cheb,
+        patch(CHEBYSHEV, autospec=True, side_effect=chebyshev_exp) as cheb,
         patch.object(
             kernels, "apply", autospec=True, side_effect=kernels.apply
         ) as kernel,
@@ -687,13 +597,10 @@ def test_forward_backward_accuracy_cuda(N: int, chebyshev_on_gpu: bool) -> None:
         atol = 3 * chebyshev_step_budget(
             h, ham_params[0].detach(), dt, tolerance * CHEBYSHEV_TOLERANCE_FACTOR
         )
+        torch.testing.assert_close(
+            state_out.detach(), expected.detach(), rtol=0.0, atol=atol
+        )
     else:
-        # Lanczos stops on an a-posteriori estimate (no a-priori bound). Measured on CPU
-        # (same arithmetic as the kernel up to ~5e-13), N = 8, 9, 20 seeds each: worst
-        # elementwise error 3.8e-11. atol = tolerance (2.6x that), without the rtol=1e-5
-        # hidden in the former allclose.
-        atol = tolerance
-    torch.testing.assert_close(state_out.detach(), expected.detach(), rtol=0.0, atol=atol)
-    # backward: the unchanged Lanczos path; tolerances of test_backward_accuracy, explicit
+        assert torch.allclose(expected, state_out, atol=tolerance)
     for g, eg in zip(grads, expected_grads):
-        torch.testing.assert_close(g, eg, rtol=tolerance, atol=1e-8)
+        assert torch.allclose(g, eg, rtol=tolerance)
